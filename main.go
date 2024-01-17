@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func main() {
@@ -14,23 +16,16 @@ func main() {
 		fileserverHits: 0,
 	}
 
-	mux := http.NewServeMux()
+	r := chi.NewRouter()
 
-	// Handler for "/app/" that serves the "index.html" from the root directory.
-	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot)))))
+	fsHandler := apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot))))
+	r.Handle("/app", fsHandler)
+	r.Handle("/app/*", fsHandler)
+	r.Get("/healthz", handlerReadiness)
+	r.Get("/metrics", apiCfg.getMetrics)
+	r.Get("/reset", apiCfg.resetHits)
 
-	// Handler for "/app/assets" that serves a different "index.html" from the "assets" directory.
-	mux.HandleFunc("/app/assets/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "./assets/test.html")
-	})
-
-	mux.HandleFunc("/reset", apiCfg.resetHits)
-
-	mux.HandleFunc("/metrics", apiCfg.getMetrics)
-
-	mux.HandleFunc("/healthz", handlerReadiness)
-
-	corsMux := middlewareCors(mux)
+	corsMux := middlewareCors(r)
 
 	srv := &http.Server{
 		Addr:    ":" + port,
