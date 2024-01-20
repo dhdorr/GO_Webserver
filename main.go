@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -42,6 +44,8 @@ func main() {
 	// rApi.Post("/validate_chirp", apiCfg.validateChirp)
 	rApi.Post("/chirps", apiCfg.validateChirp)
 	rApi.Get("/chirps", apiCfg.retrieveChirps)
+	rApi.Get("/chirps/{chirpID}", apiCfg.retrieveChirpsByID)
+	rApi.Post("/users", apiCfg.createUser)
 
 	r.Mount("/api", rApi)
 	r.Mount("/admin", rApi)
@@ -221,6 +225,15 @@ type DB struct {
 // NewDB creates a new database connection
 // and creates the database file if it doesn't exist
 func NewDB(path string) (*DB, error) {
+	dbg := flag.Bool("debug", false, "Enable debug mode")
+	flag.Parse()
+	if *dbg {
+		_, err := os.Stat(path)
+		if err == nil {
+			err = os.Remove(path)
+		}
+	}
+
 	db := &DB{
 		path: path,
 		mux:  &sync.RWMutex{},
@@ -316,4 +329,69 @@ func (db *DB) writeDB(dbStructure DBStructure) error {
 		return err
 	}
 	return nil
+}
+
+func (db *DB) getChirp(id int) (Chirp, error) {
+	dbstructure, err := db.loadDB()
+	if err != nil {
+		return Chirp{}, err
+	}
+
+	chirp, ok := dbstructure.Chirps[id]
+	if !ok {
+		return Chirp{}, os.ErrNotExist
+	}
+
+	return chirp, nil
+}
+
+func (cfg *apiConfig) retrieveChirpsByID(w http.ResponseWriter, r *http.Request) {
+	chirpIDString := chi.URLParam(r, "chirpID")
+	chirpID, err := strconv.Atoi(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid Chirp ID")
+		return
+	}
+
+	dbChirp, err := cfg.DB1.getChirp(chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Couldn't get Chirp")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, Chirp{
+		Id:   dbChirp.Id,
+		Body: dbChirp.Body,
+	})
+}
+
+func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Email string `json:"email"`
+	}
+	type returnVals struct {
+		Email string `json:"email"`
+		Id    int    `json:"id"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 500, "Something went wrong")
+	}
+
+	cfg.successfulChirps += 1
+
+	uniqueId := cfg.successfulChirps
+
+	respBody := returnVals{
+
+		Email: params.Email,
+		Id:    uniqueId,
+	}
+
+	cfg.DB1.CreateChirp(params.Email)
+
+	respondWithJSON(w, 201, respBody)
 }
