@@ -12,14 +12,27 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
+
+type apiConfig struct {
+	fileserverHits   int
+	successfulChirps int
+	DB1              *DB
+	jwtSecret        string
+}
 
 func main() {
 	const filepathRoot = "."
 	const port = "8080"
+
+	godotenv.Load()
+	jwtSecret := os.Getenv("JWT_SECRET")
 
 	db, err := NewDB("database.json")
 	if err != nil {
@@ -31,6 +44,7 @@ func main() {
 		fileserverHits:   0,
 		successfulChirps: 0,
 		DB1:              db,
+		jwtSecret:        jwtSecret,
 	}
 
 	r := chi.NewRouter()
@@ -48,6 +62,7 @@ func main() {
 	rApi.Get("/chirps/{chirpID}", apiCfg.retrieveChirpsByID)
 	rApi.Post("/users", apiCfg.createUser)
 	rApi.Post("/login", apiCfg.loginUser)
+	rApi.Put("/users", apiCfg.handlerUpdateUsers)
 
 	r.Mount("/api", rApi)
 	r.Mount("/admin", rApi)
@@ -80,12 +95,6 @@ func handlerReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
-}
-
-type apiConfig struct {
-	fileserverHits   int
-	successfulChirps int
-	DB1              *DB
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -422,8 +431,9 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 		Email    string `json:"email"`
 	}
 	type returnVals struct {
-		Email string `json:"email"`
-		Id    int    `json:"id"`
+		Email    string `json:"email"`
+		Id       int    `json:"id"`
+		Password string `json:"-"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -431,6 +441,7 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	err := decoder.Decode(&params)
 	if err != nil {
 		respondWithError(w, 500, "Something went wrong")
+		return
 	}
 
 	cfg.successfulChirps += 1
@@ -458,14 +469,21 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, 201, respBody)
 }
 
+type rUser struct {
+	ID    int    `json:"id"`
+	Email string `json:"email"`
+}
+
 func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Password string `json:"password"`
-		Email    string `json:"email"`
+		Password   string `json:"password"`
+		Email      string `json:"email"`
+		Expiration int    `json:"expires_in_seconds"`
 	}
+
 	type respVals struct {
-		ID    int    `json:"id"`
-		Email string `json:"email"`
+		rUser
+		Token string `json:"token"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -488,9 +506,26 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defaultExpiration := 60 * 60 * 24
+	if params.Expiration == 0 {
+		params.Expiration = defaultExpiration
+	} else if params.Expiration > defaultExpiration {
+		params.Expiration = defaultExpiration
+	}
+
+	// jwt token auth
+	token, err := makeJWT(user.ID, cfg.jwtSecret, time.Duration(params.Expiration)*time.Second)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create JWT")
+		return
+	}
+
 	respondWithJSON(w, http.StatusOK, respVals{
-		ID:    user.ID,
-		Email: user.Email,
+		rUser: rUser{
+			ID:    user.ID,
+			Email: user.Email,
+		},
+		Token: token,
 	},
 	)
 
@@ -498,4 +533,135 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 
 func checkPwdHash(password, hash string) error {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+}
+
+func makeJWT(userID int, tokenSecret string, expiresIn time.Duration) (string, error) {
+	signingKey := []byte(tokenSecret)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Issuer:    "chirpy",
+		IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(expiresIn)),
+		Subject:   fmt.Sprintf("%d", userID),
+	})
+
+	return token.SignedString(signingKey)
+}
+
+func (cfg *apiConfig) handlerUpdateUsers(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	type response struct {
+		rUser
+	}
+
+	token, err := GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't find JWT")
+		return
+	}
+
+	subject, err := ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't validate JWT")
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
+		return
+	}
+
+	hashedPwd, err := HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't hash password")
+		return
+	}
+
+	userIDInt, err := strconv.Atoi(subject)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't parse user ID")
+		return
+	}
+
+	user, err := cfg.DB1.UpdateUser(userIDInt, params.Email, hashedPwd)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create user")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, response{
+		rUser: rUser{
+			ID:    user.ID,
+			Email: user.Email,
+		},
+	})
+
+}
+
+func GetBearerToken(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", errors.New("Authorization required")
+	}
+	splitAuth := strings.Split(authHeader, " ")
+	if len(splitAuth) < 2 || splitAuth[0] != "Bearer" {
+		return "", errors.New("malformed authorization in header")
+	}
+	return splitAuth[1], nil
+}
+
+func HashPassword(password string) (string, error) {
+	dat, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(dat), nil
+}
+
+func ValidateJWT(tokenString, tokenSecret string) (string, error) {
+	claimsStruct := jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		&claimsStruct,
+		func(token *jwt.Token) (interface{}, error) { return []byte(tokenSecret), nil },
+	)
+	if err != nil {
+		return "", err
+	}
+
+	userIDString, err := token.Claims.GetSubject()
+	if err != nil {
+		return "", err
+	}
+
+	return userIDString, nil
+}
+
+func (db *DB) UpdateUser(id int, email, hashedPassword string) (User, error) {
+	dbStructure, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+
+	user, ok := dbStructure.Users[id]
+	if !ok {
+		return User{}, errors.New("User does not exist")
+	}
+
+	user.Email = email
+	user.HashedPassword = hashedPassword
+	dbStructure.Users[id] = user
+
+	err = db.writeDB(dbStructure)
+	if err != nil {
+		return User{}, err
+	}
+
+	return user, nil
 }
