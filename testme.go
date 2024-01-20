@@ -1,7 +1,5 @@
 package main
 
-import "fmt"
-
-func printMe() {
-	fmt.Print("howdy")
+func printMe() int {
+	return 42
 }
