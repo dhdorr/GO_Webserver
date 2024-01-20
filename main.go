@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	fmt.Println(printMe())
+	fmt.Println(PrintMe())
 	const filepathRoot = "."
 	const port = "8080"
 
