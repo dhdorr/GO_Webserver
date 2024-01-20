@@ -15,6 +15,7 @@ import (
 )
 
 func main() {
+	printMe()
 	const filepathRoot = "."
 	const port = "8080"
 
