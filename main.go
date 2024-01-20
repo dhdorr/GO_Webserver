@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/go-chi/chi/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func main() {
@@ -46,6 +47,7 @@ func main() {
 	rApi.Get("/chirps", apiCfg.retrieveChirps)
 	rApi.Get("/chirps/{chirpID}", apiCfg.retrieveChirpsByID)
 	rApi.Post("/users", apiCfg.createUser)
+	rApi.Post("/login", apiCfg.loginUser)
 
 	r.Mount("/api", rApi)
 	r.Mount("/admin", rApi)
@@ -193,6 +195,7 @@ type Chirp struct {
 
 type DBStructure struct {
 	Chirps map[int]Chirp `json:"chirps"`
+	Users  map[int]User  `json:"users"`
 }
 
 func (cfg *apiConfig) retrieveChirps(w http.ResponseWriter, r *http.Request) {
@@ -288,6 +291,7 @@ func (db *DB) ensureDB() error {
 		//create db
 		dbStructure := DBStructure{
 			Chirps: map[int]Chirp{},
+			Users:  map[int]User{},
 		}
 		err2 := db.writeDB(dbStructure)
 		return err2
@@ -345,6 +349,53 @@ func (db *DB) getChirp(id int) (Chirp, error) {
 	return chirp, nil
 }
 
+type User struct {
+	ID             int    `json:"id"`
+	Email          string `json:"email"`
+	HashedPassword string `json:"hashed_password"`
+}
+
+func (db *DB) createNewUser(email, hashedPwd string) (User, error) {
+	if _, err := db.GetUserByEmail(email); !errors.Is(err, os.ErrNotExist) {
+		return User{}, errors.New("This email is already registered")
+	}
+
+	dbStructure, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+
+	id := len(dbStructure.Users) + 1
+	user := User{
+		ID:             id,
+		Email:          email,
+		HashedPassword: hashedPwd,
+	}
+	dbStructure.Users[id] = user
+
+	err = db.writeDB(dbStructure)
+	if err != nil {
+		return User{}, err
+	}
+
+	return user, nil
+}
+
+func (db *DB) GetUserByEmail(email string) (User, error) {
+	dbStructure, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+
+	for _, user := range dbStructure.Users {
+		if user.Email == email {
+			return user, nil
+		}
+	}
+
+	return User{}, os.ErrNotExist
+}
+
 func (cfg *apiConfig) retrieveChirpsByID(w http.ResponseWriter, r *http.Request) {
 	chirpIDString := chi.URLParam(r, "chirpID")
 	chirpID, err := strconv.Atoi(chirpIDString)
@@ -367,7 +418,8 @@ func (cfg *apiConfig) retrieveChirpsByID(w http.ResponseWriter, r *http.Request)
 
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 	type returnVals struct {
 		Email string `json:"email"`
@@ -383,15 +435,67 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 
 	cfg.successfulChirps += 1
 
-	uniqueId := cfg.successfulChirps
+	//uniqueId := cfg.successfulChirps
+	hashedPwdByte, err := bcrypt.GenerateFromPassword([]byte(params.Password), 10)
 
-	respBody := returnVals{
+	// respBody := returnVals{
+	// 	Password: string(hashedPwdByte),
+	// 	Email:    params.Email,
+	// 	Id:       uniqueId,
+	// }
 
-		Email: params.Email,
-		Id:    uniqueId,
+	user, err2 := cfg.DB1.createNewUser(params.Email, string(hashedPwdByte))
+	if err2 != nil {
+		respondWithError(w, http.StatusInternalServerError, err2.Error())
+		return
 	}
 
-	cfg.DB1.CreateChirp(params.Email)
+	respBody := returnVals{
+		Email: user.Email,
+		Id:    user.ID,
+	}
 
 	respondWithJSON(w, 201, respBody)
+}
+
+func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	type respVals struct {
+		ID    int    `json:"id"`
+		Email string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters")
+		return
+	}
+
+	user, err := cfg.DB1.GetUserByEmail(params.Email)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get user")
+		return
+	}
+
+	err = checkPwdHash(params.Password, user.HashedPassword)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid password")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, respVals{
+		ID:    user.ID,
+		Email: user.Email,
+	},
+	)
+
+}
+
+func checkPwdHash(password, hash string) error {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 }
